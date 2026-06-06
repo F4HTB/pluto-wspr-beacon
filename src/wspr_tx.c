@@ -11,8 +11,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifdef __linux__
+#include <sys/random.h>
+#endif
 
 #include <iio.h>
 
@@ -25,11 +30,24 @@ struct opts {
     int wspr;
     const char *callsign;
     const char *locator;
+    const char *band;
+    int have_call;
+    int have_locator;
+    int have_power;
+    int have_rf_hz;
+    int have_band;
+    int have_offset_hz;
+    int have_lo_hz;
+    int wspr_lock_lo1400hz;
+    int have_wspr_baseband_hz;
+    int wspr_random_baseband_hz;
     int power_dbm;
     long long rf_hz;
+    long long lo_hz;
     long long fs_hz;
     long long phy_fs_hz;
     double offset_hz;
+    double wspr_baseband_hz;
     double tone_hz;
     double rf_bw_hz;
     double tx_gain_db;
@@ -58,20 +76,110 @@ static void usage(const char *p) {
         "Usage:\n"
         "  %s --probe\n"
         "  %s --tone --rf-hz HZ [--tone-hz 10000] [--fs 288000] [--phy-fs 2304000] [--seconds 10]\n"
-        "  %s --wspr --call F4XXX --locator JN38 --power 23 --rf-hz HZ [--offset-hz 10000] [--fs 288000] [--phy-fs 2304000]\n"
-        "Options:\n"
-        "  --fs HZ              TXDAC IQ sample rate, use 288000 or current card value\n"
-        "  --rf-bw HZ           AD936x TX RF bandwidth, default 23040\n"
-        "  --gain DB            AD936x TX hardwaregain/attenuation, default -30\n"
-        "  --amp N              IQ amplitude in signed int16, default 1000\n"
-        "  --dc-i N             add signed DC offset to I before TX, default 0\n"
-        "  --dc-q N             add signed DC offset to Q before TX, default 0\n"
-        "  --buffer N           IIO buffer samples, default 65536\n"
-        "  --seconds N          tone duration in seconds, default 10\n"
-        "  --duty-pct N         continuous WSPR duty cycle in percent, 0..100\n"
-        "  --wait-even-minute   wait for next even UTC minute before WSPR TX\n"
-        "  --leave-tx-on        do not power down TX LO at program exit\n",
+        "  %s --wspr --call CALL --locator LOC --power DBM (--rf-hz HZ | --band BAND)\n"
+        "     (--offset-hz HZ | --lo-hz HZ | --wspr-lock-lo1400hz) [--fs 288000] [--phy-fs 2304000]\n"
+        "\nOption tree:\n"
+        "  wspr-beacon\n"
+        "  |- --probe: inspect local IIO devices and TX attributes\n"
+        "  |\n"
+        "  |- --tone: transmit a continuous test tone\n"
+        "  |  |- required\n"
+        "  |  |  `- --rf-hz HZ: final RF frequency of the transmitted tone\n"
+        "  |  `- optional\n"
+        "  |     |- --tone-hz HZ: IQ tone frequency relative to the Local Oscillator\n"
+        "  |     |- --fs HZ: software IQ sample rate for TXDAC buffer and tone generator\n"
+        "  |     |- --phy-fs HZ: AD936x TX sample rate on the physical RF path\n"
+        "  |     |- --rf-bw HZ: AD936x TX analog/RF bandwidth setting\n"
+        "  |     |- --gain DB: AD936x TX hardware gain or attenuation\n"
+        "  |     |- --amp N: digital IQ amplitude before TX buffer\n"
+        "  |     |- --dc-i N, --dc-q N: signed DC correction added to I/Q samples\n"
+        "  |     |- --buffer N: IQ samples per libiio TX buffer\n"
+        "  |     |- --seconds N: test tone duration before stopping\n"
+        "  |     `- --leave-tx-on: keep TX Local Oscillator enabled on exit\n"
+        "  |\n"
+        "  `- --wspr: transmit a standard WSPR frame\n"
+        "     |- required message\n"
+        "     |  |- --call CALL: callsign encoded in the WSPR message\n"
+        "     |  |- --locator LOC: 4-character Maidenhead locator encoded in WSPR\n"
+        "     |  `- --power DBM: transmit power value encoded in WSPR\n"
+        "     |- RF source, exactly one\n"
+        "     |  |- --rf-hz HZ: exact final RF frequency of the WSPR signal\n"
+        "     |  `- --band BAND: AD936x-compatible WSPR band: 6m, 4m, 2m\n"
+        "     |     |- rf_hz = WSPR reference frequency + selected 1400..1600 Hz slot\n"
+        "     |     `- requires one: --wspr-baseband-hz HZ or --wspr-random-baseband-hz\n"
+        "     |- Local Oscillator strategy, exactly one\n"
+        "     |  |- --offset-hz HZ: Local Oscillator = rf_hz - offset_hz\n"
+        "     |  |  `- LO-to-WSPR-signal offset = offset_hz\n"
+        "     |  |- --lo-hz HZ: force AD936x TX Local Oscillator frequency\n"
+        "     |  |  `- LO-to-WSPR-signal offset = rf_hz - lo_hz, abs(offset) < fs_hz / 2\n"
+        "     |  `- --wspr-lock-lo1400hz: only with --band\n"
+        "     |     |- Local Oscillator = WSPR reference frequency + 1400\n"
+        "     |     `- LO-to-WSPR-signal offset = rf_hz - Local Oscillator, 0..200 Hz\n"
+        "     `- optional\n"
+        "        |- --wait-even-minute: wait until next even UTC minute before TX\n"
+        "        |- --duty-pct N: repeated WSPR scheduling with 0..100 percent duty cycle\n"
+        "        `- --leave-tx-on: keep TX Local Oscillator enabled on exit\n"
+        "\n"
+        "  common hardware/streaming options:\n"
+        "    --fs HZ, --phy-fs HZ, --rf-bw HZ, --gain DB, --amp N, --dc-i N, --dc-q N, --buffer N\n",
         p, p, p);
+}
+
+struct wspr_band_freq { const char *name; long long hz; };
+
+static const struct wspr_band_freq g_wspr_bands[] = {
+    { "6m", 50293000 },
+    { "4m", 70091000 },
+    { "2m", 144489000 },
+};
+
+static int lookup_wspr_band(const char *name, long long *hz) {
+    for (size_t i = 0; i < sizeof(g_wspr_bands) / sizeof(g_wspr_bands[0]); ++i) {
+        if (!strcmp(name, g_wspr_bands[i].name)) {
+            *hz = g_wspr_bands[i].hz;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int fail_arg(const char *msg) {
+    fprintf(stderr, "%s\n", msg);
+    return -1;
+}
+
+static int random_u32(uint32_t *v) {
+    if (!v) return -1;
+
+#ifdef __linux__
+    ssize_t n = getrandom(v, sizeof(*v), 0);
+    if (n == (ssize_t)sizeof(*v)) return 0;
+#endif
+
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) return -1;
+    size_t got = 0;
+    while (got < sizeof(*v)) {
+        ssize_t n = read(fd, (char*)v + got, sizeof(*v) - got);
+        if (n <= 0) { close(fd); return -1; }
+        got += (size_t)n;
+    }
+    close(fd);
+    return 0;
+}
+
+static int random_slot(int slot_count, int *slot) {
+    uint32_t v;
+    uint32_t limit;
+    if (!slot || slot_count <= 0) return -1;
+
+    limit = UINT32_MAX - (UINT32_MAX % (uint32_t)slot_count);
+    do {
+        if (random_u32(&v) != 0) return -1;
+    } while (v >= limit);
+
+    *slot = (int)(v % (uint32_t)slot_count);
+    return 0;
 }
 
 static int parse_ll(const char *s, long long *v) {
@@ -110,12 +218,8 @@ static int parse_args(int argc, char **argv, struct opts *o) {
     int mode_count = 0;
 
     memset(o, 0, sizeof(*o));
-    o->callsign = "F4XXX";
-    o->locator = "JN38";
-    o->power_dbm = 23;
     o->fs_hz = 288000;
     o->phy_fs_hz = 2304000;
-    o->offset_hz = 10000.0;
     o->tone_hz = 10000.0;
     o->rf_bw_hz = 23040.0;
     o->tx_gain_db = -30.0;
@@ -130,13 +234,18 @@ static int parse_args(int argc, char **argv, struct opts *o) {
         if (!strcmp(argv[i], "--probe")) o->probe = 1;
         else if (!strcmp(argv[i], "--tone")) o->tone = 1;
         else if (!strcmp(argv[i], "--wspr")) o->wspr = 1;
-        else if (!strcmp(argv[i], "--call") && i+1 < argc) o->callsign = argv[++i];
-        else if (!strcmp(argv[i], "--locator") && i+1 < argc) o->locator = argv[++i];
-        else if (!strcmp(argv[i], "--power") && i+1 < argc) { if (parse_int(argv[++i], &o->power_dbm)) return -1; }
-        else if (!strcmp(argv[i], "--rf-hz") && i+1 < argc) { if (parse_ll(argv[++i], &o->rf_hz)) return -1; }
+        else if (!strcmp(argv[i], "--call") && i+1 < argc) { o->callsign = argv[++i]; o->have_call = 1; }
+        else if (!strcmp(argv[i], "--locator") && i+1 < argc) { o->locator = argv[++i]; o->have_locator = 1; }
+        else if (!strcmp(argv[i], "--power") && i+1 < argc) { if (parse_int(argv[++i], &o->power_dbm)) return -1; o->have_power = 1; }
+        else if (!strcmp(argv[i], "--rf-hz") && i+1 < argc) { if (parse_ll(argv[++i], &o->rf_hz)) return -1; o->have_rf_hz = 1; }
+        else if (!strcmp(argv[i], "--band") && i+1 < argc) { o->band = argv[++i]; o->have_band = 1; }
         else if (!strcmp(argv[i], "--fs") && i+1 < argc) { if (parse_ll(argv[++i], &o->fs_hz)) return -1; }
         else if (!strcmp(argv[i], "--phy-fs") && i+1 < argc) { if (parse_ll(argv[++i], &o->phy_fs_hz)) return -1; }
-        else if (!strcmp(argv[i], "--offset-hz") && i+1 < argc) { if (parse_double(argv[++i], &o->offset_hz)) return -1; }
+        else if (!strcmp(argv[i], "--offset-hz") && i+1 < argc) { if (parse_double(argv[++i], &o->offset_hz)) return -1; o->have_offset_hz = 1; }
+        else if (!strcmp(argv[i], "--lo-hz") && i+1 < argc) { if (parse_ll(argv[++i], &o->lo_hz)) return -1; o->have_lo_hz = 1; }
+        else if (!strcmp(argv[i], "--wspr-lock-lo1400hz")) o->wspr_lock_lo1400hz = 1;
+        else if (!strcmp(argv[i], "--wspr-baseband-hz") && i+1 < argc) { if (parse_double(argv[++i], &o->wspr_baseband_hz)) return -1; o->have_wspr_baseband_hz = 1; }
+        else if (!strcmp(argv[i], "--wspr-random-baseband-hz")) o->wspr_random_baseband_hz = 1;
         else if (!strcmp(argv[i], "--tone-hz") && i+1 < argc) { if (parse_double(argv[++i], &o->tone_hz)) return -1; }
         else if (!strcmp(argv[i], "--rf-bw") && i+1 < argc) { if (parse_double(argv[++i], &o->rf_bw_hz)) return -1; }
         else if (!strcmp(argv[i], "--gain") && i+1 < argc) { if (parse_double(argv[++i], &o->tx_gain_db)) return -1; }
@@ -151,16 +260,70 @@ static int parse_args(int argc, char **argv, struct opts *o) {
         else return -1;
     }
     mode_count = (o->probe ? 1 : 0) + (o->tone ? 1 : 0) + (o->wspr ? 1 : 0);
-    if (mode_count != 1) return -1;
-    if ((o->tone || o->wspr) && o->rf_hz <= 0) return -1;
-    if (o->fs_hz <= 0) return -1;
-    if (o->phy_fs_hz < 0) return -1;
-    if (o->tone_hz < 0.0 || o->offset_hz < 0.0) return -1;
-    if (o->rf_bw_hz <= 0.0) return -1;
-    if (o->buffer_samples == 0) return -1;
-    if (o->duration_s <= 0) return -1;
-    if (o->duty_pct < -1 || o->duty_pct > 100) return -1;
-    if (o->duty_pct >= 0 && !o->wspr) return -1;
+    if (mode_count != 1) return fail_arg("Specify exactly one mode: --probe, --tone, or --wspr");
+    if (o->fs_hz <= 0) return fail_arg("--fs must be > 0");
+    if (o->phy_fs_hz < 0) return fail_arg("--phy-fs must be >= 0");
+    if (o->tone_hz < 0.0) return fail_arg("--tone-hz must be >= 0");
+    if (o->rf_bw_hz <= 0.0) return fail_arg("--rf-bw must be > 0");
+    if (o->amp < 0 || o->amp > 32767) return fail_arg("--amp must be 0..32767");
+    if (o->buffer_samples == 0) return fail_arg("--buffer must be > 0");
+    if (o->duration_s <= 0) return fail_arg("--seconds must be > 0");
+    if (o->duty_pct < -1 || o->duty_pct > 100) return fail_arg("--duty-pct must be 0..100");
+    if (o->duty_pct >= 0 && !o->wspr) return fail_arg("--duty-pct requires --wspr");
+
+    if (o->tone) {
+        if (!o->have_rf_hz || o->rf_hz <= 0) return fail_arg("--tone requires --rf-hz > 0");
+        if (o->have_band || o->have_call || o->have_locator || o->have_power || o->have_offset_hz ||
+            o->have_lo_hz || o->wspr_lock_lo1400hz || o->have_wspr_baseband_hz || o->wspr_random_baseband_hz ||
+            o->wait_even_minute || o->duty_pct >= 0) return fail_arg("WSPR-only options are not valid with --tone");
+    }
+
+    if (o->wspr) {
+        long long wspr_ref_hz = 0;
+        int lo_strategy_count;
+
+        if (!o->have_call) return fail_arg("--wspr requires --call");
+        if (!o->have_locator) return fail_arg("--wspr requires --locator");
+        if (!o->have_power) return fail_arg("--wspr requires --power");
+        if ((o->have_rf_hz ? 1 : 0) + (o->have_band ? 1 : 0) != 1) return fail_arg("--wspr requires exactly one of --rf-hz or --band");
+        if (o->have_rf_hz && o->rf_hz <= 0) return fail_arg("--rf-hz must be > 0");
+        if (o->have_band && lookup_wspr_band(o->band, &wspr_ref_hz) != 0) return fail_arg("unknown --band; valid AD936x-compatible bands: 6m, 4m, 2m");
+
+        if (o->have_rf_hz && (o->have_wspr_baseband_hz || o->wspr_random_baseband_hz)) return fail_arg("--wspr-baseband-hz and --wspr-random-baseband-hz require --band");
+        if (o->have_rf_hz && o->wspr_lock_lo1400hz) return fail_arg("--wspr-lock-lo1400hz requires --band");
+        if (o->have_band && ((o->have_wspr_baseband_hz ? 1 : 0) + (o->wspr_random_baseband_hz ? 1 : 0)) != 1) return fail_arg("--band requires exactly one of --wspr-baseband-hz or --wspr-random-baseband-hz");
+        if (o->have_wspr_baseband_hz && (o->wspr_baseband_hz < 1400.0 || o->wspr_baseband_hz > 1600.0)) return fail_arg("--wspr-baseband-hz must be 1400..1600 Hz");
+
+        if (o->have_band) {
+            double baseband = o->wspr_baseband_hz;
+            if (o->wspr_random_baseband_hz) {
+                int slot;
+                if (random_slot(21, &slot) != 0) return fail_arg("cannot read system randomness for --wspr-random-baseband-hz");
+                baseband = 1400.0 + (double)(slot * 10);
+            }
+            o->rf_hz = wspr_ref_hz + (long long)llround(baseband);
+            o->have_rf_hz = 1;
+            printf("WSPR band %s: wspr_ref_hz=%lld wspr_slot_hz=%.3f rf_hz=%lld\n", o->band, wspr_ref_hz, baseband, o->rf_hz);
+        }
+
+        lo_strategy_count = (o->have_offset_hz ? 1 : 0) + (o->have_lo_hz ? 1 : 0) + (o->wspr_lock_lo1400hz ? 1 : 0);
+        if (lo_strategy_count != 1) return fail_arg("--wspr requires exactly one Local Oscillator strategy: --offset-hz, --lo-hz, or --wspr-lock-lo1400hz");
+        if (o->have_offset_hz) {
+            if (o->offset_hz < 0.0) return fail_arg("--offset-hz must be >= 0");
+            if (o->offset_hz >= (double)o->fs_hz / 2.0) return fail_arg("--offset-hz must be < --fs / 2");
+            o->lo_hz = o->rf_hz - (long long)llround(o->offset_hz);
+        } else if (o->have_lo_hz) {
+            if (o->lo_hz <= 0) return fail_arg("--lo-hz must be > 0");
+            o->offset_hz = (double)(o->rf_hz - o->lo_hz);
+            if (fabs(o->offset_hz) >= (double)o->fs_hz / 2.0) return fail_arg("abs(rf_hz - lo_hz) must be < --fs / 2");
+        } else {
+            o->lo_hz = wspr_ref_hz + 1400;
+            o->offset_hz = (double)(o->rf_hz - o->lo_hz);
+            if (fabs(o->offset_hz) >= (double)o->fs_hz / 2.0) return fail_arg("--wspr-lock-lo1400hz computed LO-to-WSPR-signal offset must be < --fs / 2");
+        }
+        if (o->lo_hz <= 0) return fail_arg("computed Local Oscillator must be > 0");
+        printf("WSPR tuning: rf_hz=%lld local_oscillator_hz=%lld lo_to_wspr_signal_hz=%.3f\n", o->rf_hz, o->lo_hz, o->offset_hz);
+    }
     return 0;
 }
 
@@ -346,8 +509,8 @@ static int configure_rf(struct iio_context *ctx, const struct opts *o) {
     disable_internal_dds(txd);
     set_dac_dma_sources(txd);
 
-    long long lo_hz = o->rf_hz - (long long)llround(o->wspr ? o->offset_hz : o->tone_hz);
-    if (lo_hz <= 0) { fprintf(stderr, "invalid LO computed\n"); return -1; }
+    long long lo_hz = o->wspr ? o->lo_hz : o->rf_hz - (long long)llround(o->tone_hz);
+    if (lo_hz <= 0) { fprintf(stderr, "invalid Local Oscillator computed\n"); return -1; }
 
     /* Conservative TX settings. Some firmwares reject optional attrs; do not fail on those. */
     write_str_chan(phy0, "rf_port_select", "A", 0);
@@ -369,8 +532,13 @@ static int configure_rf(struct iio_context *ctx, const struct opts *o) {
     if (write_ll_chan(lo, "frequency", lo_hz, 1) < 0) return -1;
     write_ll_chan(lo, "powerdown", 0, 0);
 
-    printf("Configured: rf_hz=%lld lo=%lld fs=%lld phy_fs=%lld offset/tone=%.3f amp=%d dc_i=%d dc_q=%d gain=%.2f bw=%.0f\n",
-           o->rf_hz, lo_hz, o->fs_hz, o->phy_fs_hz, o->wspr ? o->offset_hz : o->tone_hz, o->amp, o->dc_i, o->dc_q, o->tx_gain_db, o->rf_bw_hz);
+    if (o->wspr) {
+        printf("Configured: rf_hz=%lld local_oscillator_hz=%lld fs=%lld phy_fs=%lld lo_to_wspr_signal_hz=%.3f amp=%d dc_i=%d dc_q=%d gain=%.2f bw=%.0f\n",
+               o->rf_hz, lo_hz, o->fs_hz, o->phy_fs_hz, o->offset_hz, o->amp, o->dc_i, o->dc_q, o->tx_gain_db, o->rf_bw_hz);
+    } else {
+        printf("Configured: rf_hz=%lld local_oscillator_hz=%lld fs=%lld phy_fs=%lld lo_to_tone_hz=%.3f amp=%d dc_i=%d dc_q=%d gain=%.2f bw=%.0f\n",
+               o->rf_hz, lo_hz, o->fs_hz, o->phy_fs_hz, o->tone_hz, o->amp, o->dc_i, o->dc_q, o->tx_gain_db, o->rf_bw_hz);
+    }
     return 0;
 }
 
@@ -497,7 +665,7 @@ static int tx_session_run(struct tx_session *s, const struct opts *o) {
 
     printf("Done, streamed %.3f seconds%s\n",
            (double)sample_global / (double)o->fs_hz,
-           o->leave_tx_on ? " (TX LO left on)" : " (TX LO powered down)");
+           o->leave_tx_on ? " (TX Local Oscillator left on)" : " (TX Local Oscillator powered down)");
     return 0;
 }
 

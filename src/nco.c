@@ -6,8 +6,8 @@
 uint64_t nco_phase_inc(double freq_hz, double sample_rate_hz) {
     long double scale = 18446744073709551616.0L; /* 2^64 */
     long double v = ((long double)freq_hz * scale) / (long double)sample_rate_hz;
-    if (v < 0) v = 0;
-    if (v > scale - 1.0L) v = scale - 1.0L;
+    while (v < 0.0L) v += scale;
+    while (v >= scale) v -= scale;
     return (uint64_t)(v + 0.5L);
 }
 
