@@ -27,6 +27,13 @@ This prints the detected IIO devices and a few useful transmit-side attributes.
 ./wspr-beacon --tone --rf-hz 144490000 --tone-hz 1000000 --fs 2304000 --phy-fs 2304000 --rf-bw 23040 --gain -20 --amp 800 --seconds 10
 ```
 
+```text
+Tone tuning:
+  Final tone RF frequency = 144490000 Hz
+  IQ tone frequency relative to the Local Oscillator = 1000000 Hz
+  Local Oscillator = 144490000 - 1000000 = 143490000 Hz
+```
+
 Typical uses:
 - checking the transmit chain
 - setting a safe output level
@@ -40,10 +47,24 @@ HF example with an explicit final RF frequency and LO offset.
 ./wspr-beacon --wspr --call F4XXX --locator JN18 --power 23 --rf-hz 144490000 --offset-hz 10000 --fs 288000 --phy-fs 2304000 --gain -40 --wait-even-minute
 ```
 
+```text
+WSPR tuning:
+  Final WSPR RF frequency = 144490000 Hz
+  LO-to-WSPR-signal offset = 10000 Hz
+  Local Oscillator = 144490000 - 10000 = 144480000 Hz
+```
+
 2m example with an explicit final RF frequency and LO offset.
 
 ```sh
 ./wspr-beacon --wspr --call F4HTB --locator JN18 --power 23 --rf-hz 144490000 --offset-hz 1000000 --fs 2304000 --phy-fs 2304000 --rf-bw 23040 --gain -20 --amp 800
+```
+
+```text
+WSPR tuning:
+  Final WSPR RF frequency = 144490000 Hz
+  LO-to-WSPR-signal offset = 1000000 Hz
+  Local Oscillator = 144490000 - 1000000 = 143490000 Hz
 ```
 
 2m example with an explicit final RF frequency and fixed LO.
@@ -52,16 +73,41 @@ HF example with an explicit final RF frequency and LO offset.
 ./wspr-beacon --wspr --call F4HTB --locator JN18 --power 23 --rf-hz 144490000 --lo-hz 143490000 --fs 2304000 --phy-fs 2304000 --rf-bw 23040 --gain -20 --amp 800
 ```
 
+```text
+WSPR tuning:
+  Final WSPR RF frequency = 144490000 Hz
+  Local Oscillator = 143490000 Hz
+  LO-to-WSPR-signal offset = 144490000 - 143490000 = 1000000 Hz
+```
+
 Band example with a fixed WSPR baseband position.
 
 ```sh
 ./wspr-beacon --wspr --call F4HTB --locator JN18 --power 23 --band 2m --wspr-baseband-hz 1500 --offset-hz 1000000 --fs 2304000 --phy-fs 2304000 --gain -20 --wait-even-minute
 ```
 
+```text
+WSPR tuning:
+  WSPR reference frequency for 2m = 144489000 Hz
+  Selected WSPR slot = 1500 Hz
+  Final WSPR RF frequency = 144489000 + 1500 = 144490500 Hz
+  LO-to-WSPR-signal offset = 1000000 Hz
+  Local Oscillator = 144490500 - 1000000 = 143490500 Hz
+```
+
 Band example with a random WSPR baseband position and LO locked to the 1400 Hz reference.
 
 ```sh
 ./wspr-beacon --wspr --call F4HTB --locator JN18 --power 23 --band 2m --wspr-random-baseband-hz --wspr-lock-lo1400hz --fs 2304000 --phy-fs 2304000 --gain -20 --wait-even-minute
+```
+
+```text
+WSPR tuning:
+  WSPR reference frequency for 2m = 144489000 Hz
+  Selected WSPR slot = random value from 1400 to 1600 Hz in 10 Hz steps
+  Final WSPR RF frequency = 144489000 + selected WSPR slot
+  Local Oscillator = 144489000 + 1400 = 144490400 Hz
+  LO-to-WSPR-signal offset = selected WSPR slot - 1400, from 0 to 200 Hz
 ```
 
 ## Main Options
