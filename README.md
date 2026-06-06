@@ -314,3 +314,17 @@ Expected output should mention ARM, for example:
 ```text
 wspr-beacon: ELF 32-bit LSB executable, ARM
 ```
+
+## Acknowledgements
+
+Thanks to Evariste F5OEO for the Tezuka firmware project:
+
+https://github.com/F5OEO/tezuka_fw
+
+Without this project, this work would not have been possible.
+
+Development and tests were done on this SDR board:
+
+https://fr.aliexpress.com/item/1005009725878296.html
+
+This project was developed with Visual Studio Code, the Kilo Code extension, Codex, and ChatGPT by OpenAI.
